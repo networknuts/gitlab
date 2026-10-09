@@ -1,0 +1,15 @@
+stages:
+    - build
+
+build_image:
+  image: docker
+  stage: build
+  services:
+    - docker:dind
+  script:
+#    - docker login -u alokaryan -p my-password-in-plain-text registry.gitlab.com
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+# we used the same path in manually creating image
+    - docker build -t $CI_REGISTRY/networknuts/kubernetes-data/cardio:v1 .
+    - docker push $CI_REGISTRY/networknuts/kubernetes-data/cardio:v1
+    - echo "Image built and Pushed"

@@ -1,0 +1,69 @@
+stages:
+    - build
+    - deploy
+    - cleanup
+
+build_image:
+  image: docker
+  stage: build
+  services:
+    - docker:dind
+  script:
+#    - docker login -u alokaryan -p my-password-in-plain-text registry.gitlab.com
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+# we used the same path in manually creating image
+    - docker build -t $CI_REGISTRY/networknuts/kubernetes-data/cardio:v1 .
+    - docker push $CI_REGISTRY/networknuts/kubernetes-data/cardio:v1
+    - echo "Image built and Pushed"
+
+deploy_app:
+  stage: deploy
+  image: debian:13-slim
+  variables:
+    KUBECTL_VERSION: v1.34
+    DEBIAN_FRONTEND: noninteractive
+  script:
+    # Follows https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/#install-using-native-package-management
+    - apt-get update
+    - apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg
+    - curl --fail --silent --show-error --location "https://pkgs.k8s.io/core:/stable:/${KUBECTL_VERSION}/deb/Release.key" | gpg --dearmor --output /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBECTL_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+    - chmod 644 /etc/apt/sources.list.d/kubernetes.list
+    - apt-get update
+    - apt-get install -y --no-install-recommends kubectl
+    - kubectl config get-contexts
+    - kubectl config use-context networknuts/kubernetes-connection:kubernetes-agent
+    - kubectl get pods
+    - kubectl get nodes -o wide
+    - echo "Deploying CARDIO application to Kubernetes"
+    - ls -l $CI_PROJECT_DIR/appconfig
+    - kubectl apply -f $CI_PROJECT_DIR/appconfig/
+    - kubectl get pods
+    - kubectl get svc
+    
+cleanup_app:
+  stage: cleanup
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/kubernetes-connection:kubernetes-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  before_script:
+    # Switch to the Kubernetes agent context configured via GitLab
+    - kubectl config use-context "$KUBE_CONTEXT"
+  script:
+    - kubectl delete -f $CI_PROJECT_DIR/appconfig/
+    # - kubectl delete all --all -n ${KUBE_NAMESPACE}
+    # - kubectl delete ingress,pvc,configmaps,secrets --all -n ${KUBE_NAMESPACE}
+    # - kubectl delete deployment my-app-deployment --namespace "$K8S_NAMESPACE" --ignore-not-found=true
+    # - kubectl delete all -l app=my-app --namespace "$K8S_NAMESPACE" --ignore-not-found=true
+  rules:
+    # Restrict this to manual execution or specific branches for safety
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+
