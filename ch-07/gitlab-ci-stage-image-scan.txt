@@ -1,0 +1,70 @@
+stages:
+  - lint
+  - build
+  - scan
+
+# Variables
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  # Use the commit SHA to uniquely tag the image 
+  # during the pipeline execution
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+# --------------------------------------
+# Checking Dockerfile for best practices
+# --------------------------------------
+
+dockerfile_lint:
+  stage: lint
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint Dockerfile
+  rules:
+    #run linter only if Dockerfile changes
+    - changes:
+        - Dockerfile
+
+# ---------------------------------------
+# Building Image
+# ---------------------------------------
+
+build_image:
+  stage: build
+  image: docker:stable
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # Build the image using the commit SHA tag
+    - docker build -t $IMAGE_TAG .
+    # Push to GitLab's built-in container registry 
+    # so the next stage can pull it
+    - docker push $IMAGE_TAG
+
+# ----------------------------------------
+# Scanning image for vulnerabilities
+# ----------------------------------------
+
+trivy_scan:
+  stage: scan
+  image: 
+    name: public.ecr.aws/aquasecurity/trivy:latest
+#    name: aquasecurity/trivy:latest
+    entrypoint: [""] # Required for GitLab runners to execute scripts properly
+  cache:
+    # Caches the vulnerability database to speed up consecutive pipeline runs
+    key: trivy-db-cache
+    paths:
+      - .trivycache/
+#  before_script:
+#    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # 1. Print out a comprehensive, human-readable report 
+    #    in the GitLab CI logs
+    - trivy image --cache-dir .trivycache/ $IMAGE_TAG
+    
+    # 2. Re-run the scan but force the pipeline to fail 
+    #    ONLY if CRITICAL issues exist
+    - trivy image --cache-dir .trivycache/ --exit-code 1 --severity CRITICAL $IMAGE_TAG

@@ -1,0 +1,34 @@
+docker_build:
+  image: docker
+  services:
+    - docker:24.0.6-dind
+  stage: build
+  script:
+    - echo "Building Docker image..."
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker build -t $CONTAINER_IMAGE .
+    - docker push $CONTAINER_IMAGE
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        echo "Tagging Docker image with Git tag..."
+        docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+        docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+      fi
+
+#git tag 1.0.0
+#git push --tags
+#Manual - IMG_VERSION = 1.0.0
+
+#in the deploy job, you can make it manual
+deploy_to_prod:
+  stage: deploy
+  variables: 
+    IMG_VERSION: $CI_COMMIT_SHORT_SHA
+  script:
+    - 
+    -
+  when: manual
+  only:
+    - main
+
+
