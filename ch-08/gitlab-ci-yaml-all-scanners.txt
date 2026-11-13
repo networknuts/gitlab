@@ -1,0 +1,217 @@
+stages:
+    - test               #stage added for SAST
+    - lint
+    - build
+    - scan
+    - secure
+    - deploy
+    - cleanup
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  # Use the commit SHA to uniquely tag the image 
+  # during the pipeline execution
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+# --------------------------------------
+# Enabling SAST & Secret Detection  << should be in single include >>
+# --------------------------------------
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+  - template: Jobs/Container-Scanning.gitlab-ci.yml 
+  - template: Jobs/SAST-IaC.gitlab-ci.yml
+
+secret_detection:
+  variables:
+    SECRET_DETECTION_HISTORIC_SCAN: "true"
+
+container_scanning:
+  variables:
+    CS_DISABLE_LANGUAGE_VULNERABILITY_SCAN: "false"
+    SECURE_LOG_LEVEL: 'debug'
+    CS_IMAGE: registry.gitlab.com/networknuts/lab-data/cardio:v1
+#    CS_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+# --------------------------------------
+# Failing pipeline if secret detected
+# --------------------------------------
+validate_secrets:
+  stage: test
+  dependencies:
+    - secret_detection
+  script:
+    - |
+      if [ -f "gl-secret-detection-report.json" ]; then
+        # Check if vulnerabilities array is not empty
+        count=$(jq '.vulnerabilities | length' gl-secret-detection-report.json)
+        echo "Detected $count secrets."
+        if [ "$count" -gt 0 ]; then
+          echo "Pipeline failed because secrets were detected!"
+          exit 1
+        fi
+      else
+        echo "Report artifact not found."
+        exit 1
+      fi
+  allow_failure: false
+
+
+# --------------------------------------
+# Checking Dockerfile for best practices
+# --------------------------------------
+
+dockerfile_lint:
+  stage: lint
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint Dockerfile
+  rules:
+    #run linter only if Dockerfile changes
+    - changes:
+        - Dockerfile
+
+# ------------------------------------------
+# Building image & pushing once its passed hadolinter
+# ------------------------------------------
+
+build_image:
+  image: docker
+  stage: build
+  services:
+    - docker:dind
+  script:
+#    - docker login -u alokaryan -p my-password-in-plain-text registry.gitlab.com
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+# we used the same path in manually creating image
+    # Build the image using the commit SHA tag
+    - docker build -t $IMAGE_TAG .
+    # Push to GitLab's built-in container registry 
+    # so the next stage can pull it
+    - docker push $IMAGE_TAG
+    - echo "Image built and Pushed"
+
+# ----------------------------------------
+# Scanning image for vulnerabilities
+# ----------------------------------------
+
+trivy_scan:
+  stage: scan
+  image: 
+    name: public.ecr.aws/aquasecurity/trivy:latest
+#    name: aquasecurity/trivy:latest
+    entrypoint: [""] # Required for GitLab runners to execute scripts properly
+  cache:
+    # Caches the vulnerability database to speed up consecutive pipeline runs
+    key: trivy-db-cache
+    paths:
+      - .trivycache/
+#  before_script:
+#    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # 1. Print out a comprehensive, human-readable report 
+    #    in the GitLab CI logs
+    - trivy image --cache-dir .trivycache/ $IMAGE_TAG
+    
+    # 2. Re-run the scan but force the pipeline to fail 
+    #    ONLY if CRITICAL issues exist
+    - trivy image --cache-dir .trivycache/ --exit-code 1 --severity CRITICAL $IMAGE_TAG
+
+
+
+# ------------------------------------
+# Checking Kubernetes configuration files
+# ------------------------------------
+
+validate-manifests:
+  stage: scan
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+    - curl -L https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz -C /usr/local/bin/
+  script:
+    - kubeconform -kubernetes-version 1.35.9 -strict -summary -output json appconfig/
+
+
+# ------------------------------------
+# Scanning for security configurations
+# ------------------------------------
+
+kube-score-check:
+  stage: secure
+  image: 
+    name: zegl/kube-score:latest
+    entrypoint: [""]
+  script:
+  #scanning yaml for security checks
+  - /kube-score score --ignore-test pod-probes,pod-networkpolicy appconfig/*.yaml
+
+# -----------------------------------------
+# Application deploy stage
+# -----------------------------------------
+
+
+deploy_app:
+  stage: deploy
+  image: debian:13-slim
+  variables:
+    KUBECTL_VERSION: v1.34
+    DEBIAN_FRONTEND: noninteractive
+  script:
+    # Follows https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/#install-using-native-package-management
+    - apt-get update
+    - apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg
+    - curl --fail --silent --show-error --location "https://pkgs.k8s.io/core:/stable:/${KUBECTL_VERSION}/deb/Release.key" | gpg --dearmor --output /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBECTL_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+    - chmod 644 /etc/apt/sources.list.d/kubernetes.list
+    - apt-get update
+    - apt-get install -y --no-install-recommends kubectl
+    - kubectl config get-contexts
+    - kubectl config use-context networknuts/lab-connection:cluster-agent
+    - kubectl config get-contexts
+    - kubectl get pods
+    - kubectl get nodes -o wide
+    - echo "Deploying CARDIO application to Kubernetes"
+    - ls -l $CI_PROJECT_DIR/appconfig
+    - kubectl apply -f $CI_PROJECT_DIR/appconfig/
+    - echo "======================"
+    - echo "Updating the new image"
+    - echo "======================"
+    - kubectl set image deployment/webapp boxone=$IMAGE_TAG
+    - echo ""
+    - echo ""
+    - echo "Verifying application status"
+    - echo ""
+    - echo ""
+    - kubectl rollout status deployment/webapp
+    - kubectl get pods
+    - kubectl get svc
+  when: manual
+    
+cleanup_app:
+  stage: cleanup
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/lab-connection:cluster-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  before_script:
+    # Switch to the Kubernetes agent context configured via GitLab
+    - kubectl config use-context "$KUBE_CONTEXT"
+  script:
+    - kubectl delete -f $CI_PROJECT_DIR/appconfig/
+    # - kubectl delete all --all -n ${KUBE_NAMESPACE}
+    # - kubectl delete ingress,pvc,configmaps,secrets --all -n ${KUBE_NAMESPACE}
+    # - kubectl delete deployment my-app-deployment --namespace "$K8S_NAMESPACE" --ignore-not-found=true
+    # - kubectl delete all -l app=my-app --namespace "$K8S_NAMESPACE" --ignore-not-found=true
+  rules:
+    # Restrict this to manual execution or specific branches for safety
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+
