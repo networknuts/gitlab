@@ -1,0 +1,48 @@
+#Step 1 - Install python
+
+sudo apt install -y python3-full
+sudo apt install python3-pip -y
+
+#Step 2 - As root, create project directory and copy code files
+
+mkdir ~/counterapp
+cd counterapp
+python3 -m venv .venv
+source .venv/bin/activate
+pip install flask
+
+vim app.py
+
+##file start here
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def hello():
+  return 'Hello, All!'
+
+app.run(host='0.0.0.0', port=80)
+## file ends here
+
+python3 app.py
+
+Now access the application from desktop browser - http://ip-of-vm:80
+
+## now in order to run this from other machine.. we need to install all
+## dependencies and then run
+
+## we will now install pyinstaller - to bundle it all as single bundle
+## which includes all dependencides
+
+pip install pyinstaller
+pyinstaller app.py
+cd dist/app
+./app          #now it a web application - running directly
+
+## this is what we need to automate using gitlab cicd pipeline
+
+
+
+
+
