@@ -1,0 +1,37 @@
+stages:
+  - build
+  - push
+
+build-job:
+  stage: build
+#  image: python:3.11.2-slim-buster
+  image: python:latest
+  before_script:
+    - apt update -y && apt install binutils zip -y
+  script:
+    - mkdir artifacts
+    - ls -la
+    - cd code
+    - pip install -r requirements.txt
+    - pip install pyinstaller
+    - pyinstaller app.py
+    - ls -la
+    - cd dist
+    - zip -r app app
+    - ls -la
+    - cp app.zip ../../artifacts/
+  artifacts:
+     paths:
+       - artifacts
+  when: manual
+
+push-job:
+  stage: push
+  image: alpine
+  before_script:
+    - apk update && apk add curl
+  script:
+    - ls -la
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file artifacts/app.zip "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/application/0.0.1/app.zip"'
+  needs: ['build-job']
+  when: manual
