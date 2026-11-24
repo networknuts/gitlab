@@ -1,0 +1,87 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  LATEST_TAG: $CI_REGISTRY_IMAGE:latest
+
+# Stage 1: Run tests using GitLab's file-based dependency cache
+test_app:
+  stage: test
+  image: node:20-alpine
+  cache:
+    # Cache key updates automatically only when package-lock.json changes
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+    # Pull cache at start of job, push updates at end of job
+    policy: pull-push
+  before_script:
+    # Install dependencies using the local .npm cache without hitting the internet
+    - npm install --package-lock-only
+    - npm ci --cache .npm --prefer-offline
+  script:
+    - npm test
+  artifacts:
+    paths:
+      - package-lock.json
+    expire_in: 1 hour # Optional
+
+# Stage 2: Build the Docker image (Node + Nginx) using Docker Layer Caching
+build_docker_image:
+  stage: build
+  image: docker:27.3.1
+  services:
+    - docker:27.3.1-dind
+  dependencies:
+    - test_app # Downloads package-lock.json into the project root
+  before_script:
+    # using the already created variables in the project from deploy access tokens
+    - docker login -u $CI_DEPLOY_USER -p $CI_DEPLOY_PASSWORD $CI_REGISTRY
+  script:
+    - ls -la package-lock.json # Optional: verify the file is in the root
+    # Pull the previous 'latest' image to reuse cached layers (if available)
+    - docker pull $LATEST_TAG || true
+    # Build using inline cache metadata so future builds reuse the npm install layer
+    - >
+      docker build
+      --build-arg BUILDKIT_INLINE_CACHE=1
+      --cache-from $LATEST_TAG
+      -t $IMAGE_TAG
+      -t $LATEST_TAG
+      .
+    - docker push $IMAGE_TAG
+    - docker push $LATEST_TAG
+
+# Stage 3: Deploy the exact commit image to Kubernetes
+deploy_k8s:
+  stage: deploy
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/lab-connection:cluster-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  rules:
+    # Only deploy automatically when changes are merged/pushed to the main branch
+    - if: $CI_COMMIT_BRANCH == "main"
+  before_script:
+    - kubectl config use-context "$KUBE_CONTEXT"
+  script:
+    - kubectl create secret docker-registry gitlab-registry-secret --docker-server=registry.gitlab.com --docker-username=$CI_DEPLOY_USER --docker-password=$CI_DEPLOY_PASSWORD
+    # Inject the exact commit-tagged image into the manifest
+    - sed -i "s|IMAGE_PLACEHOLDER|$IMAGE_TAG|g" k8s/deployment.yaml
+    # Apply the updated configuration and wait for the rolling update to finish
+    - kubectl apply -f k8s/deployment.yaml
+    - kubectl rollout status deployment/node-nginx-app --timeout=120s
+    - kubectl get pods
+    - kubectl get service
+  when: manual

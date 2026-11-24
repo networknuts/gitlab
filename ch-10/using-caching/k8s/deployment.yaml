@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-nginx-app
+  labels:
+    app: node-nginx-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: node-nginx-app
+  template:
+    metadata:
+      labels:
+        app: node-nginx-app
+    spec:
+      # Required if your GitLab Container Registry is private
+      imagePullSecrets:
+        - name: gitlab-registry-secret
+      containers:
+        - name: node-nginx
+          # Placeholder replaced dynamically during the GitLab deploy stage
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-nginx-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: node-nginx-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+
