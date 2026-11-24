@@ -1,0 +1,75 @@
+stages:
+  - build
+  - test
+  - package
+  - deploy
+
+build_frontend:
+  stage: build
+  image: node:20-alpine
+  script:
+    - echo "Building frontend..."
+    - mkdir -p frontend/dist && touch frontend/dist/index.html
+  artifacts:
+    paths:
+      - frontend/dist/
+
+test_frontend:
+  stage: test
+  image: node:20-alpine
+  needs:
+    - job: build_frontend
+      artifacts: true
+  script:
+    - echo "Testing frontend bundle..."
+
+deploy_frontend:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - test_frontend
+  script:
+    - echo "Deploying frontend to CDN..."
+
+build_backend:
+  stage: build
+  image: golang:1.22-alpine
+  script:
+    - echo "Compiling backend..."
+  artifacts:
+    paths:
+      - backend/bin/
+
+test_backend:
+  stage: test
+  image: golang:1.22-alpine
+  needs:
+    - job: build_backend
+      artifacts: true
+  script:
+    - echo "Running backend unit tests..."
+
+package_backend:
+  stage: package
+  image: docker:24.0.5
+  needs:
+    - test_backend
+  script:
+    - echo "Building backend Docker image..."
+
+deploy_backend:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - package_backend
+  script:
+    - echo "Deploying backend container..."
+
+e2e_smoke_tests:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - deploy_frontend
+    - deploy_backend
+  script:
+    - echo "Running full-stack smoke tests..."
