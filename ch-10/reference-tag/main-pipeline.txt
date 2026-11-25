@@ -1,0 +1,35 @@
+## vim .gitlab-ci.yml
+
+
+include:
+  - local: 'ci-templates/nginx-setup.yml'
+
+stages:
+  - test
+  - deploy
+
+# Job 1: Uses the exact before_script from .nginx_base
+test_nginx_routing:
+  stage: test
+  image: ubuntu:22.04
+  variables:
+    NGINX_CONF_PATH: !reference [.nginx_base, variables, NGINX_CONF_PATH]
+  before_script:
+    - !reference [.nginx_base, before_script]
+  script:
+    - service nginx start
+    - curl -I http://localhost:80
+
+# Job 2: Reuses .nginx_base before_script AND adds an extra step
+deploy_static_site:
+  stage: deploy
+  image: ubuntu:22.04
+  variables:
+    NGINX_CONF_PATH: !reference [.nginx_base, variables, NGINX_CONF_PATH]
+  before_script:
+    - !reference [.nginx_base, before_script]
+    - mkdir -p /var/www/html
+    - cp -r ./dist/* /var/www/html/
+  script:
+    - service nginx reload
+    - echo "Site deployed and Nginx reloaded."
