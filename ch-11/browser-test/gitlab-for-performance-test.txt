@@ -1,0 +1,176 @@
+stages:
+  - build
+  - push
+  - image
+  - deploy
+  - tunnel
+  - performance
+  - cleanup
+
+include:
+  # - template: Verify/Browser-Performance.gitlab-ci.yml
+  - template: Jobs/Browser-Performance-Testing.gitlab-ci.yml
+
+variables:
+  # Adjust these variables to match your Generic Package Registry path
+  PACKAGE_NAME: "application"
+  PACKAGE_VERSION: "0.0.1"
+  BINARY_FILE_NAME: "app"
+  ZIP_FILE_NAME: "app.zip"
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  KUBE_NAMESPACE: default
+  TARGET_SERVICE_URL: "http://python-app-svc.default.svc.cluster.local:80"
+
+
+build_code:
+  stage: build
+#  image: python:3.11.2-slim-buster
+  image: python:latest
+  before_script:
+    - apt update -y && apt install binutils zip -y
+  script:
+    - mkdir artifacts
+    - ls -la
+    - cd code
+    - pip install -r requirements.txt
+    - pip install pyinstaller
+    - pyinstaller app.py
+    - ls -la
+    - cd dist
+    - zip -r app app
+    - ls -la
+    - cp app.zip ../../artifacts/
+  artifacts:
+     paths:
+       - artifacts
+  when: manual
+
+push_code:
+  stage: push
+  image: alpine
+  before_script:
+    - apk update && apk add curl
+  script:
+    - ls -la
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file artifacts/app.zip "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/application/0.0.1/app.zip"'
+  needs: ['build_code']
+  when: manual
+
+
+
+build_image:
+  stage: image
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  before_script:
+    - apk add --no-cache curl unzip
+    - docker login -u $CI_DEPLOY_USER -p $CI_DEPLOY_PASSWORD $CI_REGISTRY
+  script:
+    - 'curl --header "PRIVATE-TOKEN: $PKG_TOKEN" --fail --location "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${PACKAGE_VERSION}/${ZIP_FILE_NAME}" --output package.zip'
+    - unzip -q package.zip -d extracted_app
+    - docker build -t "$IMAGE_TAG" .
+    - docker push "$IMAGE_TAG"
+  when: manual
+
+
+deploy_to_k8s:
+  stage: deploy
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/lab-connection:cluster-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  # Uncomment if using a local GitLab Runner inside your self-hosted network
+  # tags:
+  #   - self-hosted-k8s
+  before_script:
+    - kubectl config use-context "$KUBE_CONTEXT"
+  script:
+    - kubectl config get-contexts
+    - kubectl create secret docker-registry gitlab-registry-secret --docker-server=registry.gitlab.com --docker-username=$CI_DEPLOY_USER --docker-password=$CI_DEPLOY_PASSWORD
+    - echo "Deploying PYTHON APP to Kubernetes"
+    - sed -i "s|<YOUR_IMAGE_TAG>|$IMAGE_TAG|g" k8s/deployment.yaml
+    - kubectl apply -f k8s/
+    - kubectl rollout status deployment/python-app
+    - kubectl get pods
+    - kubectl get svc
+  when: manual
+
+start_tunnel:
+  stage: tunnel
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/lab-connection:cluster-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  before_script:
+    - kubectl config use-context "$KUBE_CONTEXT"
+  script:
+    - kubectl config get-contexts
+    # Start a temporary cloudflared pod pointing to your ClusterIP service
+    - kubectl run cloudflared-${CI_PIPELINE_ID} -n ${KUBE_NAMESPACE} --image=cloudflare/cloudflared:latest --restart=Never -- tunnel --no-autoupdate --url ${TARGET_SERVICE_URL}
+    # Wait for the pod to run and print the generated trycloudflare.com URL
+    - kubectl wait --for=condition=Ready pod/cloudflared-${CI_PIPELINE_ID} -n ${KUBE_NAMESPACE} --timeout=60s
+    - sleep 5
+    - TUNNEL_URL=$(kubectl logs cloudflared-${CI_PIPELINE_ID} -n ${KUBE_NAMESPACE} | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -n 1)
+    - echo "Tunnel URL is ${TUNNEL_URL}"
+    - echo "${TUNNEL_URL}" > environment_url.txt
+  artifacts:
+    paths:
+      - environment_url.txt
+
+
+browser_performance:
+  stage: performance
+  needs:
+    - start_tunnel
+
+stop_tunnel:
+  stage: cleanup
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/lab-connection:cluster-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  before_script:
+    # Switch to the Kubernetes agent context configured via GitLab
+    - kubectl config use-context "$KUBE_CONTEXT"
+  when: manual
+  script:
+    - kubectl delete pod cloudflared-${CI_PIPELINE_ID} -n ${KUBE_NAMESPACE} --ignore-not-found
+
+
+cleanup_app:
+  stage: cleanup
+  variables:
+  # The path to your registered GitLab Agent connection context
+    KUBE_CONTEXT: "networknuts/lab-connection:cluster-agent"
+  # Target namespace for deletion (optional, if your manifests don't hardcode it)
+    KUBE_NAMESPACE: "default"
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  before_script:
+    # Switch to the Kubernetes agent context configured via GitLab
+    - kubectl config use-context "$KUBE_CONTEXT"
+  script:
+    - kubectl delete -f $CI_PROJECT_DIR/k8s/
+    # - kubectl delete all --all -n ${KUBE_NAMESPACE}
+    # - kubectl delete ingress,pvc,configmaps,secrets --all -n ${KUBE_NAMESPACE}
+    # - kubectl delete deployment my-app-deployment --namespace "$K8S_NAMESPACE" --ignore-not-found=true
+    # - kubectl delete all -l app=my-app --namespace "$K8S_NAMESPACE" --ignore-not-found=true
+  rules:
+    # Restrict this to manual execution or specific branches for safety
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
